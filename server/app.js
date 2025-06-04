@@ -64,13 +64,14 @@ const corsOptions = {
     // Allow requests with no origin (like mobile apps or Postman)
     if (!origin) return callback(null, true);
     
-    // Define allowed origins
+     // Define allowed origins
     const allowedOrigins = [
       'http://localhost:3000',
       'http://localhost:8080',
       'http://127.0.0.1:3000',
-      // Add your production domain here
-      // 'https://yourdomain.com'
+      'http://srv853567.hstgr.cloud',
+      'http://185.199.52.60',
+      'https://thoroughdentalcare.in'
     ];
     
     if (allowedOrigins.includes(origin)) {
