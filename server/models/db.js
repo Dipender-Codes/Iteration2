@@ -1,7 +1,21 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-// Create a connection pool
+// Security configuration
+const SECURITY_CONFIG = {
+  MAX_QUERY_LENGTH: 10000,
+  MAX_PARAM_LENGTH: 1000,
+  ALLOWED_OPERATIONS: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'],
+  RATE_LIMIT: {
+    maxQueries: 100,
+    windowMs: 60000 // 1 minute
+  }
+};
+
+// Rate limiting storage (in production, use Redis)
+const rateLimitStore = new Map();
+
+// Create a connection pool with security configurations
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
@@ -9,11 +23,118 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || 'dental_clinic_booking',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  acquireTimeout: 60000,
+  timeout: 60000,
+  multipleStatements: false, // Prevent SQL injection via multiple statements
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 // Database utility functions
 const db = {
+  // Security validation functions
+  validateQuery(sql) {
+    if (!sql || typeof sql !== 'string') {
+      throw new Error('Invalid query: SQL must be a non-empty string');
+    }
+    
+    if (sql.length > SECURITY_CONFIG.MAX_QUERY_LENGTH) {
+      throw new Error('Query too long: Potential DoS attack');
+    }
+    
+    // Check for dangerous SQL patterns
+    const dangerousPatterns = [
+      /;\s*(drop|truncate|delete|alter|create|exec|execute|sp_|xp_)/i,
+      /union.*select/i,
+      /\/\*.*\*\//i, // Block comments
+      /--.*$/i, // Line comments
+      /\bor\b.*['"]\s*['"]/i, // OR-based injection
+      /\band\b.*['"]\s*['"]/i, // AND-based injection
+      /\bxor\b/i,
+      /benchmark\s*\(/i,
+      /sleep\s*\(/i,
+      /waitfor\s+delay/i,
+      /load_file\s*\(/i,
+      /outfile\s*['"]/i,
+      /dumpfile\s*['"]/i
+    ];
+    
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(sql)) {
+        throw new Error('Potentially malicious SQL detected');
+      }
+    }
+    
+    return true;
+  },
+
+  validateParams(params) {
+    if (!Array.isArray(params)) {
+      throw new Error('Parameters must be an array');
+    }
+    
+    for (const param of params) {
+      if (param !== null && param !== undefined) {
+        const paramStr = String(param);
+        if (paramStr.length > SECURITY_CONFIG.MAX_PARAM_LENGTH) {
+          throw new Error('Parameter too long: Potential buffer overflow attack');
+        }
+        
+        // Check for suspicious patterns in parameters
+        const suspiciousPatterns = [
+          /script\s*>/i,
+          /<\s*iframe/i,
+          /javascript:/i,
+          /vbscript:/i,
+          /on\w+\s*=/i
+        ];
+        
+        for (const pattern of suspiciousPatterns) {
+          if (pattern.test(paramStr)) {
+            throw new Error('Potentially malicious parameter detected');
+          }
+        }
+      }
+    }
+    
+    return true;
+  },
+
+  // Rate limiting check
+  checkRateLimit(identifier = 'default') {
+    const now = Date.now();
+    const windowStart = now - SECURITY_CONFIG.RATE_LIMIT.windowMs;
+    
+    if (!rateLimitStore.has(identifier)) {
+      rateLimitStore.set(identifier, []);
+    }
+    
+    const requests = rateLimitStore.get(identifier);
+    
+    // Remove old requests outside the window
+    const validRequests = requests.filter(timestamp => timestamp > windowStart);
+    
+    if (validRequests.length >= SECURITY_CONFIG.RATE_LIMIT.maxQueries) {
+      throw new Error('Rate limit exceeded');
+    }
+    
+    validRequests.push(now);
+    rateLimitStore.set(identifier, validRequests);
+    
+    return true;
+  },
+
+  // Sanitize input data
+  sanitizeInput(input) {
+    if (typeof input === 'string') {
+      return input
+        .trim()
+        .replace(/[\x00-\x1F\x7F-\x9F]/g, '') // Remove control characters
+        .substring(0, SECURITY_CONFIG.MAX_PARAM_LENGTH);
+    }
+    return input;
+  },
+
   // Test the database connection
   async testConnection() {
     try {
@@ -22,39 +143,105 @@ const db = {
       connection.release();
       return true;
     } catch (error) {
-      console.error('Database connection failed:', error);
+      console.error('Database connection failed:', error.message);
       return false;
     }
   },
 
-  // Execute a query with parameters
-  async query(sql, params = []) {
+  // Execute a query with parameters (secured)
+  async query(sql, params = [], identifier = 'default') {
     try {
-      const [results] = await pool.execute(sql, params);
+      // Rate limiting
+      this.checkRateLimit(identifier);
+      
+      // Validate query and parameters
+      this.validateQuery(sql);
+      this.validateParams(params);
+      
+      // Sanitize parameters
+      const sanitizedParams = params.map(param => this.sanitizeInput(param));
+      
+      const [results] = await pool.execute(sql, sanitizedParams);
       return results;
     } catch (error) {
-      console.error('Database query error:', error);
+      // Log security incidents
+      if (error.message.includes('malicious') || error.message.includes('Rate limit')) {
+        console.error('SECURITY ALERT:', {
+          message: error.message,
+          sql: sql.substring(0, 100) + '...', // Log only first 100 chars
+          timestamp: new Date().toISOString(),
+          identifier
+        });
+      } else {
+        console.error('Database query error:', error.message);
+      }
       throw error;
     }
   },
 
-  
-  // === Booking Functions (Incorporated from booking.model.js) ===
+  // === Booking Functions (Secured) ===
 
   /**
-   * Create a new appointment with end time calculated based on service duration
-   * @param {Object} bookingData - Contains appointment details
-   * @returns {Promise<number>} - Returns the appointment ID
+   * Create a new appointment with enhanced security
    */
   async createAppointment(bookingData) {
     try {
+      // Input validation and sanitization
+      const requiredFields = ['fullName', 'email', 'phone', 'serviceId', 'appointmentDate', 'startTime'];
+      for (const field of requiredFields) {
+        if (!bookingData[field]) {
+          throw new Error(`Missing required field: ${field}`);
+        }
+      }
+
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(bookingData.email)) {
+        throw new Error('Invalid email format');
+      }
+
+      // Validate phone format (basic)
+      const phoneRegex = /^[\d\s\-\+\(\)]{10,15}$/;
+      if (!phoneRegex.test(bookingData.phone)) {
+        throw new Error('Invalid phone format');
+      }
+
+      // Validate date format (YYYY-MM-DD)
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRegex.test(bookingData.appointmentDate)) {
+        throw new Error('Invalid date format');
+      }
+
+      // Validate time format (HH:MM:SS)
+      const timeRegex = /^\d{2}:\d{2}:\d{2}$/;
+      if (!timeRegex.test(bookingData.startTime)) {
+        throw new Error('Invalid time format');
+      }
+
+      // Validate service ID (alphanumeric only)
+      const serviceIdRegex = /^[a-zA-Z0-9_-]+$/;
+      if (!serviceIdRegex.test(bookingData.serviceId)) {
+        throw new Error('Invalid service ID format');
+      }
+
+      // Sanitize text inputs
+      const sanitizedData = {
+        fullName: this.sanitizeInput(bookingData.fullName),
+        email: this.sanitizeInput(bookingData.email),
+        phone: this.sanitizeInput(bookingData.phone),
+        serviceId: this.sanitizeInput(bookingData.serviceId),
+        appointmentDate: bookingData.appointmentDate,
+        startTime: bookingData.startTime,
+        additionalNotes: this.sanitizeInput(bookingData.additionalNotes || '')
+      };
+
       // Get service duration
       const serviceQuery = `
         SELECT duration_minutes 
         FROM services 
         WHERE service_id = ? AND is_active = TRUE
       `;
-      const [service] = await this.query(serviceQuery, [bookingData.serviceId]);
+      const [service] = await this.query(serviceQuery, [sanitizedData.serviceId], 'service-lookup');
       
       if (!service) {
         throw new Error('Invalid or inactive service');
@@ -63,7 +250,7 @@ const db = {
       const serviceDuration = service.duration_minutes;
       
       // Calculate end time based on start time and duration
-      const startTime = bookingData.startTime;
+      const startTime = sanitizedData.startTime;
       const [hours, minutes, seconds] = startTime.split(':').map(Number);
       
       // Convert to minutes for easier calculation
@@ -75,7 +262,7 @@ const db = {
       const endMins = endMinutes % 60;
       const endTime = `${endHours.toString().padStart(2, '0')}:${endMins.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
       
-      // First, check if the time slot is available
+      // Check availability
       const availabilityQuery = `
         SELECT 1 FROM appointments 
         WHERE 
@@ -89,13 +276,13 @@ const db = {
       `;
       
       const availabilityParams = [
-        bookingData.appointmentDate,
-        endTime, bookingData.startTime,
-        endTime, bookingData.startTime,
-        bookingData.startTime, endTime
+        sanitizedData.appointmentDate,
+        endTime, sanitizedData.startTime,
+        endTime, sanitizedData.startTime,
+        sanitizedData.startTime, endTime
       ];
       
-      const existingAppointments = await this.query(availabilityQuery, availabilityParams);
+      const existingAppointments = await this.query(availabilityQuery, availabilityParams, 'availability-check');
       
       if (existingAppointments.length > 0) {
         throw new Error('Selected time slot is already booked');
@@ -106,7 +293,7 @@ const db = {
         SELECT 1 FROM blocked_dates 
         WHERE blocked_date = ?
       `;
-      const blockedResult = await this.query(blockedQuery, [bookingData.appointmentDate]);
+      const blockedResult = await this.query(blockedQuery, [sanitizedData.appointmentDate], 'blocked-check');
       
       if (blockedResult.length > 0) {
         throw new Error('Selected date is not available for booking');
@@ -129,46 +316,57 @@ const db = {
       `;
       
       const params = [
-        bookingData.fullName,
-        bookingData.email,
-        bookingData.phone,
-        bookingData.serviceId,
-        bookingData.appointmentDate,
-        bookingData.startTime,
+        sanitizedData.fullName,
+        sanitizedData.email,
+        sanitizedData.phone,
+        sanitizedData.serviceId,
+        sanitizedData.appointmentDate,
+        sanitizedData.startTime,
         endTime,
-        bookingData.additionalNotes
+        sanitizedData.additionalNotes
       ];
       
-      const result = await this.query(insertQuery, params);
+      const result = await this.query(insertQuery, params, 'appointment-insert');
       
-      // Return the appointment ID
       return result.insertId;
     } catch (error) {
-      console.error('Error creating appointment:', error);
+      console.error('Error creating appointment:', error.message);
       throw error;
     }
   },
   
   /**
-   * Get available time slots based on service duration
-   * @param {string} date - Date string in YYYY-MM-DD format
-   * @param {string} serviceId - Service ID
-   * @returns {Promise<Array>} - Available time slots
+   * Get available time slots with security validation
    */
   async getAvailableTimeSlots(date, serviceId) {
     try {
+      // Input validation
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRegex.test(date)) {
+        throw new Error('Invalid date format');
+      }
+
+      const serviceIdRegex = /^[a-zA-Z0-9_-]+$/;
+      if (!serviceIdRegex.test(serviceId)) {
+        throw new Error('Invalid service ID format');
+      }
+
+      // Sanitize inputs
+      const sanitizedDate = this.sanitizeInput(date);
+      const sanitizedServiceId = this.sanitizeInput(serviceId);
+
       // Check if the date is blocked
       const blockedQuery = `
         SELECT 1 FROM blocked_dates WHERE blocked_date = ?
       `;
-      const blockedResult = await this.query(blockedQuery, [date]);
+      const blockedResult = await this.query(blockedQuery, [sanitizedDate], 'blocked-date-check');
       
       if (blockedResult.length > 0) {
         return [];
       }
       
       // Get the day of week
-      const parsedDate = new Date(date);
+      const parsedDate = new Date(sanitizedDate);
       const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
       const dayOfWeek = dayNames[parsedDate.getDay()];
       
@@ -178,7 +376,7 @@ const db = {
         FROM business_hours 
         WHERE day_of_week = ?
       `;
-      const [businessHours] = await this.query(businessHoursQuery, [dayOfWeek]);
+      const [businessHours] = await this.query(businessHoursQuery, [dayOfWeek], 'business-hours-check');
       
       if (!businessHours || !businessHours.is_open) {
         return [];
@@ -188,7 +386,7 @@ const db = {
       const serviceQuery = `
         SELECT duration_minutes FROM services WHERE service_id = ? AND is_active = TRUE
       `;
-      const [service] = await this.query(serviceQuery, [serviceId]);
+      const [service] = await this.query(serviceQuery, [sanitizedServiceId], 'service-duration-check');
       
       if (!service) {
         throw new Error('Service not found or inactive');
@@ -202,9 +400,9 @@ const db = {
         FROM appointments 
         WHERE appointment_date = ? AND status != 'cancelled'
       `;
-      const bookedSlots = await this.query(appointmentsQuery, [date]);
+      const bookedSlots = await this.query(appointmentsQuery, [sanitizedDate], 'appointments-check');
       
-      // Generate available time slots
+      // Generate available time slots (rest of the logic remains the same)
       const availableSlots = [];
       
       // Parse business hours
@@ -248,7 +446,6 @@ const db = {
         }
         
         // Calculate buffer time if needed
-        // If service duration is not a multiple of 30, add buffer time
         const bufferMinutes = serviceDuration % 30 === 0 ? 0 : 30 - (serviceDuration % 30);
         
         // Check if there's enough buffer after this appointment ends
@@ -276,35 +473,48 @@ const db = {
       
       return availableSlots;
     } catch (error) {
-      console.error('Error getting available time slots:', error);
+      console.error('Error getting available time slots:', error.message);
       throw error;
     }
   },
 
-  // Utility function for formatting dates (referenced in booking.model.js)
+  // Enhanced date formatting with validation
   formatDateForDb(date) {
     if (!date) return null;
     
     if (date instanceof Date) {
-      return date.toISOString().split('T')[0];
+      const formatted = date.toISOString().split('T')[0];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(formatted)) {
+        throw new Error('Invalid date format after conversion');
+      }
+      return formatted;
     }
     
-    // If it's already in YYYY-MM-DD format, return as is
+    // If it's already in YYYY-MM-DD format, validate and return
     if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const parsedDate = new Date(date);
+      if (isNaN(parsedDate.getTime())) {
+        throw new Error('Invalid date value');
+      }
       return date;
     }
     
     // Try to parse the date and format it
     try {
       const parsedDate = new Date(date);
-      return parsedDate.toISOString().split('T')[0];
+      if (isNaN(parsedDate.getTime())) {
+        throw new Error('Invalid date value');
+      }
+      const formatted = parsedDate.toISOString().split('T')[0];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(formatted)) {
+        throw new Error('Invalid date format after parsing');
+      }
+      return formatted;
     } catch (error) {
-      console.error('Error formatting date:', error);
-      return null;
+      console.error('Error formatting date:', error.message);
+      throw new Error('Unable to format date');
     }
   }
-
-  
 };
 
 module.exports = db;
