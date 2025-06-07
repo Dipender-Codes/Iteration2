@@ -17,10 +17,10 @@ const rateLimitStore = new Map();
 
 // Create a connection pool with security configurations
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'dpandey13',
-  database: process.env.DB_NAME || 'dental_clinic_booking',
+  host: process.env.DB_HOST || 'srv611.hstgr.io',
+  user: process.env.DB_USER || 'u963206240_thoroughdental',
+  password: process.env.DB_PASSWORD || 'Dipender@2622',
+  database: process.env.DB_NAME || 'u963206240_dental_booking',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
