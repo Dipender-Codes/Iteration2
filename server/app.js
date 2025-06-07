@@ -67,10 +67,8 @@ const corsOptions = {
      // Define allowed origins
     const allowedOrigins = [
       'http://localhost:3000',
-      'http://localhost:8080',
       'http://127.0.0.1:3000',
       'http://srv853567.hstgr.cloud',
-      'http://185.199.52.60',
       'https://thoroughdentalcare.in'
     ];
     
